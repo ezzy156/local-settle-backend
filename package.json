@@ -18,6 +18,7 @@
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.js",
+    "check:env-docs": "node scripts/check-env-docs.js",
     "postinstall": "prisma generate"
   },
   "dependencies": {
@@ -120,5 +121,9 @@
       "browserslist": "4.28.1",
       "electron-to-chromium": "1.5.313"
     }
+  },
+  "packageManager": "pnpm@11.13.0",
+  "engines": {
+    "node": ">=22 <23"
   }
 }

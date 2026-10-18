@@ -15,6 +15,7 @@ import {
 } from '@prisma/client';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
+import { CreateAuditLogInput } from '../audit-log/interfaces/create-audit-log.interface';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { ORDER_STATUS } from './order.constants';
 import {
@@ -42,9 +43,9 @@ type OrderCreateData = {
   buyerId: string;
   sellerId: string;
   assetAmount: string;
-  fiatAmount: string;
   orderStatus?: string;
   expiresAt?: Date;
+  auditLog: CreateAuditLogInput;
   escrow: {
     contractId: string;
     sellerAddress: string;
@@ -90,6 +91,17 @@ export class OrderService {
    *    prompt the seller to sign.
    */
   async create(dto: CreateOrderDto): Promise<OrderDetailResponse> {
+    const activeDuplicate = await this.repo.findActiveForOfferBuyer(
+      dto.offerId,
+      dto.buyerId,
+    );
+    if (activeDuplicate) {
+      throw new AppException(
+        ErrorCode.INVALID_ORDER_STATUS,
+        'An active order already exists for this buyer and offer.',
+      );
+    }
+
     const orderId = randomUUID();
 
     this.logger.log(
@@ -115,9 +127,16 @@ export class OrderService {
       buyerId: dto.buyerId,
       sellerId: dto.sellerId,
       assetAmount: dto.assetAmount,
-      fiatAmount: dto.fiatAmount,
       orderStatus: dto.orderStatus,
       expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : undefined,
+      auditLog: {
+        userId: dto.buyerId,
+        action: AuditAction.ORDER_CREATED,
+        resourceType: 'Order',
+        resourceId: orderId,
+        result: AuditResult.SUCCESS,
+        metadata: { offerId: dto.offerId, sellerId: dto.sellerId },
+      },
       escrow: {
         contractId,
         sellerAddress: dto.sellerAddress,
@@ -132,15 +151,6 @@ export class OrderService {
 
     this.logger.log(`Order ${orderId} and escrow persisted successfully.`);
 
-    await this.auditLogService.create({
-      userId: dto.buyerId,
-      action: AuditAction.ORDER_CREATED,
-      resourceType: 'Order',
-      resourceId: orderId,
-      result: AuditResult.SUCCESS,
-      metadata: { offerId: dto.offerId, sellerId: dto.sellerId },
-    });
-
     // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Return combined response ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
     return {
       ...order,
@@ -150,7 +160,7 @@ export class OrderService {
     };
   }
 
-  list(p: PaginationDto, q: OrderFilter): Promise<OrderWithRelations[]> {
+  list(p: PaginationDto, q: OrderFilter) {
     const where: Record<string, unknown> = {};
     if (q.offerId) where.offerId = q.offerId;
     if (q.buyerId) where.buyerId = q.buyerId;
@@ -160,7 +170,7 @@ export class OrderService {
     }
     if (q.status) where.orderStatus = q.status as order_status;
 
-    return this.repo.search(where, p.skip, p.take);
+    return this.repo.searchPage(where, p.skip ?? 0, p.take ?? 20);
   }
 
   async get(id: string): Promise<OrderWithRelations> {
@@ -176,6 +186,7 @@ export class OrderService {
 
   async update(id: string, dto: UpdateOrderDto): Promise<Order> {
     const data: Record<string, unknown> = { ...dto };
+    delete data.orderStatus;
     if (dto.expiresAt) data.expiresAt = new Date(dto.expiresAt);
     const updated = (await this.repo.update(id, data)) as Order;
 
@@ -289,9 +300,7 @@ export class OrderService {
       previousStatus: order.orderStatus,
     });
 
-    return this.repo.update(id, {
-      orderStatus: ORDER_STATUS.CANCELLED,
-    }) as Promise<Order>;
+    return this.repo.cancelAndReleaseReservation(id);
   }
 
   getUserStats(userId: string): Promise<UserStats> {
@@ -437,10 +446,16 @@ export class OrderService {
         : ORDER_STATUS.EXPIRED;
 
     // 3. Update order status in the database
-    await this.prisma.order.update({
-      where: { orderId: order.orderId },
-      data: { orderStatus: targetStatus },
-    });
+    await this.prisma.$transaction([
+      this.prisma.order.update({
+        where: { orderId: order.orderId },
+        data: { orderStatus: targetStatus },
+      }),
+      this.prisma.offer.updateMany({
+        where: { offerId: order.offerId, executed: true },
+        data: { executed: false },
+      }),
+    ]);
 
     // 4. Create Structured Audit Log
     this.logger.log('order.expiration.audit', {

@@ -60,6 +60,15 @@ export class GcsFileStorageService
     }
   }
 
+  async deleteFile(storedUrl: string): Promise<void> {
+    const prefix = `${this.publicUrlBase}/`;
+    if (!storedUrl.startsWith(prefix)) {
+      throw new Error('Stored evidence URL is outside the configured bucket');
+    }
+    const key = decodeURIComponent(storedUrl.slice(prefix.length));
+    await this.bucket.file(key).delete({ ignoreNotFound: true });
+  }
+
   async uploadFile(file: UploadFileInput): Promise<StoredFile> {
     const key =
       file.key ??
@@ -87,26 +96,27 @@ export class GcsFileStorageService
     };
   }
 
-  async getSignedDownloadUrlFromUrl(url: string): Promise<string> {
-    const pathname = new URL(url).pathname;
-    const bucketMarker = `/${this.bucketName}/`;
-    const bucketIndex = pathname.indexOf(bucketMarker);
-    if (bucketIndex < 0) {
-      throw new Error('Evidence URL is outside the storage bucket');
+  async getSignedDownloadUrl(
+    storedUrl: string,
+    expiresInSeconds: number,
+  ): Promise<string> {
+    const prefix = `${this.publicUrlBase}/`;
+    if (!storedUrl.startsWith(prefix)) {
+      throw new Error('Stored evidence URL is outside the configured bucket');
     }
-
-    const key = decodeURIComponent(
-      pathname.slice(bucketIndex + bucketMarker.length),
-    );
+    const key = decodeURIComponent(storedUrl.slice(prefix.length));
     if (!key.startsWith('evidence/')) {
-      throw new Error('Evidence URL is not an evidence object');
+      throw new Error('Stored URL is not an evidence object');
     }
-
-    const [signedUrl] = await this.bucket.file(key).getSignedUrl({
+    const [url] = await this.bucket.file(key).getSignedUrl({
       version: 'v4',
       action: 'read',
-      expires: Date.now() + 5 * 60 * 1000,
+      expires: Date.now() + expiresInSeconds * 1000,
     });
-    return signedUrl;
+    return url;
+  }
+
+  getSignedDownloadUrlFromUrl(url: string): Promise<string> {
+    return this.getSignedDownloadUrl(url, 5 * 60);
   }
 }

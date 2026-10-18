@@ -6,11 +6,17 @@ import { AuthModule } from '../auth/auth.module';
 import { ChatMessageGateway } from './chat-message.gateway';
 import { FileStorageModule } from '../file-storage/file-storage.module';
 import { AuditLogModule } from '../audit-log/audit-log.module';
+import { SetupCompleteGuard } from '../auth/setup-complete.guard';
 
 @Module({
   imports: [AuthModule, FileStorageModule, AuditLogModule],
   controllers: [ChatMessageController],
-  providers: [ChatMessageService, ChatMessageRepository, ChatMessageGateway],
+  providers: [
+    ChatMessageService,
+    ChatMessageRepository,
+    ChatMessageGateway,
+    SetupCompleteGuard,
+  ],
   exports: [ChatMessageService],
 })
 export class ChatMessageModule {}

@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { ConflictException, Injectable } from '@nestjs/common';
 import { BaseRepository } from '../../common/base.repository';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { Order, Prisma } from '@prisma/client';
@@ -7,6 +7,7 @@ import {
   PAYMENT_METHOD_SELECT,
 } from '../../common/prisma-selects';
 import { ORDER_STATUS } from './order.constants';
+import { CreateAuditLogInput } from '../audit-log/interfaces/create-audit-log.interface';
 
 export const ORDER_DETAIL_INCLUDE = {
   offer: {
@@ -23,10 +24,40 @@ export type OrderWithRelations = Prisma.OrderGetPayload<{
   include: typeof ORDER_DETAIL_INCLUDE;
 }>;
 
+const SCALE = 10_000_000n;
+
+function toScaled(value: string | number): bigint {
+  const text = String(value);
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(text);
+  if (!match) throw new Error('Order amounts and offer prices must be decimal values.');
+  const fraction = match[2] ?? '';
+  let scaled = BigInt(match[1]) * SCALE + BigInt(fraction.slice(0, 7).padEnd(7, '0') || '0');
+  if (fraction.length > 7 && fraction[7] >= '5') scaled += 1n;
+  return scaled;
+}
+
+/** Multiplies 7-place asset values and rounds fiat totals to 2 places, half up. */
+export function calculateFiatAmount(assetAmount: string | number, price: string | number): string {
+  const product = toScaled(assetAmount) * toScaled(price);
+  const cents = (product + 500_000_000_000n) / 1_000_000_000_000n;
+  return `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
+}
+
 @Injectable()
 export class OrderRepository extends BaseRepository {
   constructor(private readonly prisma: PrismaService) {
     super(prisma.order, 'orderId');
+  }
+
+  findActiveForOfferBuyer(offerId: string, buyerId: string) {
+    return this.prisma.order.findFirst({
+      where: {
+        offerId,
+        buyerId,
+        orderStatus: { in: [ORDER_STATUS.CREATED, ORDER_STATUS.LOCKED] },
+      },
+      select: { orderId: true },
+    });
   }
 
   // Override create to atomically create order+escrow and mark the offer as executed.
@@ -38,9 +69,10 @@ export class OrderRepository extends BaseRepository {
     buyerId: string;
     sellerId: string;
     assetAmount: string | number;
-    fiatAmount: string | number;
+    fiatAmount?: string | number;
     orderStatus?: string;
     expiresAt?: Date | string | null;
+    auditLog?: CreateAuditLogInput;
     // Escrow data to persist alongside the order
     escrow?: {
       contractId: string;
@@ -50,13 +82,46 @@ export class OrderRepository extends BaseRepository {
     };
   }): Promise<Order & { escrowId: string | null }> {
     const created = await this.prisma.$transaction(async (tx) => {
+      // Lock the offer row so concurrent orders cannot reserve the same remaining amount.
+      const [offer] = await tx.$queryRaw<
+        Array<{
+          max_amount: Prisma.Decimal;
+          min_amount: Prisma.Decimal;
+          price: Prisma.Decimal;
+          status: string;
+        }>
+      >`SELECT max_amount, min_amount, price, status FROM offer WHERE offer_id = ${data.offerId}::uuid FOR UPDATE`;
+      if (!offer || offer.status !== 'active') {
+        throw new ConflictException('Offer is unavailable');
+      }
+
+      const requestedAmount = new Prisma.Decimal(data.assetAmount);
+      const minAmount = new Prisma.Decimal(offer.min_amount);
+      const maxAmount = new Prisma.Decimal(offer.max_amount);
+      const fiatAmount = calculateFiatAmount(data.assetAmount, String(offer.price));
+      const now = new Date();
+      const reserved = await tx.order.aggregate({
+        where: {
+          offerId: data.offerId,
+          orderStatus: { in: ['created', 'locked', 'disputed'] },
+          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+        },
+        _sum: { assetAmount: true },
+      });
+      const usedAmount = reserved._sum.assetAmount ?? new Prisma.Decimal(0);
+      const remaining = maxAmount.minus(usedAmount);
+      if (requestedAmount.lessThan(minAmount) || requestedAmount.greaterThan(remaining)) {
+        throw new ConflictException(
+          `Order amount must be at least ${minAmount.toString()} and no more than the remaining offer amount ${remaining.toString()}`,
+        );
+      }
       const payload = {
         ...(data.orderId ? { orderId: data.orderId } : {}),
         offerId: data.offerId,
         buyerId: data.buyerId,
         sellerId: data.sellerId,
         assetAmount: data.assetAmount,
-        fiatAmount: data.fiatAmount,
+        fiatAmount,
         orderStatus: data.orderStatus || undefined,
         expiresAt: data.expiresAt ? new Date(data.expiresAt) : undefined,
       } as Prisma.OrderUncheckedCreateInput;
@@ -79,15 +144,49 @@ export class OrderRepository extends BaseRepository {
         escrowId = escrow.escrowId;
       }
 
-      // Mark the offer as executed so it no longer appears in the active market
+      const totalReserved = usedAmount.plus(requestedAmount);
       await tx.offer.update({
         where: { offerId: data.offerId },
-        data: { executed: true },
+        data: { executed: totalReserved.greaterThanOrEqualTo(maxAmount) },
       });
+
+      // Keep the audit record in the same transaction as the business change.
+      // If either write fails, neither the order nor its audit entry commits.
+      if (data.auditLog) {
+        await tx.auditLog.create({
+          data: {
+            userId: data.auditLog.userId,
+            action: data.auditLog.action,
+            resourceType: data.auditLog.resourceType,
+            resourceId: data.auditLog.resourceId,
+            result: data.auditLog.result,
+            ipAddress: data.auditLog.ipAddress,
+            userAgent: data.auditLog.userAgent,
+            correlationId: data.auditLog.correlationId,
+            metadata: data.auditLog.metadata as
+              | Prisma.InputJsonValue
+              | undefined,
+          },
+        });
+      }
       return { ...order, escrowId };
     });
 
     return created;
+  }
+
+  async cancelAndReleaseReservation(orderId: string): Promise<Order> {
+    return this.prisma.$transaction(async (tx) => {
+      const order = await tx.order.update({
+        where: { orderId },
+        data: { orderStatus: ORDER_STATUS.CANCELLED },
+      });
+      await tx.offer.updateMany({
+        where: { offerId: order.offerId, executed: true },
+        data: { executed: false },
+      });
+      return order;
+    });
   }
 
   search(
@@ -102,6 +201,22 @@ export class OrderRepository extends BaseRepository {
       orderBy: { orderId: 'desc' },
       include: ORDER_DETAIL_INCLUDE,
     });
+  }
+
+  async searchPage(where: Record<string, unknown>, skip = 0, take = 20) {
+    const [items, total] = await Promise.all([
+      this.search(where, skip, take),
+      this.prisma.order.count({ where: where as Prisma.OrderWhereInput }),
+    ]);
+    const hasMore = skip + items.length < total;
+    return {
+      items,
+      total,
+      skip,
+      take,
+      hasMore,
+      nextSkip: hasMore ? skip + items.length : null,
+    };
   }
 
   findById(id: string): Promise<OrderWithRelations | null> {

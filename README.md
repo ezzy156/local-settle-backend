@@ -18,6 +18,8 @@ LocalSettle is a peer-to-peer marketplace that connects local payment methods wi
 
 `POST /auth/challenge` creates a short-lived random challenge for a public key. The connected wallet signs it locally. `POST /auth/login` verifies the signature, consumes the challenge once, and returns a session token. The API verifies public-key ownership; it does not need the user's secret key for this flow.
 
+The login token is temporary and can be used to validate an alias and complete `POST /users/:id/setup`. That bootstrap route remains available before setup is complete. The setup response returns a final token with the `setupComplete: true` claim; profile, payment, trading, chat, and wallet routes that declare `SetupCompleteGuard` require that final token.
+
 ### Direct USDC payment
 
 The authenticated client calls `GET /send/resolve` for a Stellar address or LocalSettle alias, then `POST /send/prepare`. The API reads recipient account information, builds an unsigned Stellar transaction XDR, and returns it for review. The client asks the user's wallet to sign. `POST /send/submit` broadcasts the signed XDR through Horizon and returns the transaction result.
@@ -76,14 +78,18 @@ Protocol references: [Stellar developer documentation](https://developers.stella
 
 ## Run locally
 
-Requirements: Node.js 20+, npm, and PostgreSQL. Copy `.env.example` to `.env`; configure `DATABASE_URL`, `DIRECT_URL`, and a local `JWT_SECRET`. For Stellar features, configure `STELLAR_HORIZON_URL`, `STELLAR_RPC_URL`, `STELLAR_NETWORK`, and the relevant issuer and Trustless Work values. Use test credentials and Testnet accounts only.
+Requirements: Node.js 22 (see `.nvmrc`), pnpm 11.13.0 (pinned in `package.json`), and PostgreSQL. Copy `.env.example` to `.env`; configure `DATABASE_URL`, `DIRECT_URL`, and a local `JWT_SECRET`. For Stellar features, configure `STELLAR_HORIZON_URL`, `STELLAR_RPC_URL`, `STELLAR_NETWORK`, and the relevant issuer and Trustless Work values. Use test credentials and Testnet accounts only.
+
+Payment identifiers are encrypted with AES-256-GCM before persistence. Configure a 32-byte base64 key using the deployment secret manager (`PAYMENT_DATA_ENCRYPTION_KEYS` maps key versions to keys and `PAYMENT_DATA_ENCRYPTION_CURRENT_VERSION` selects the write key). Keep old key versions available while rows still use them; add the new key, switch the current version, then retire an old key only after its data has been re-encrypted. Existing plaintext records are encrypted on their next read.
 
 ```bash
-npm install
+pnpm install --frozen-lockfile
 npx prisma generate
 npx prisma migrate dev
-npm run start:dev
+pnpm run start:dev
 ```
+
+For production, commit the generated migration directory and run `pnpm exec prisma migrate deploy` as a release step. Keep `DATABASE_URL` pointed at the runtime pool and `DIRECT_URL` at the direct database connection. CI runs `prisma validate` using placeholder URLs and does not connect to a database.
 
 The API listens on port `3001` by default. The frontend should point `NEXT_PUBLIC_API_URL` at `http://localhost:3001`. Never commit real secrets. The existing `IKASH_*` escrow environment variable names are retained for deployment compatibility; see `.env.example` before configuring them.
 
@@ -99,14 +105,26 @@ The API listens on port `3001` by default. The frontend should point `NEXT_PUBLI
 
 Routes have endpoint-specific validation and guards. Check the controller and DTO before relying on an endpoint's authentication or ownership behavior.
 
+Escrow evidence uploads accept only matching PDF, JPEG, PNG, or WebP extensions and MIME types. Storage keys use generated UUID filenames and are persisted in `evidence_key`; apply the `add_escrow_evidence_key` migration before deploying this change.
+
+Order creation records `ORDER_CREATED` in the same database transaction as the order, escrow record, and offer execution update. Audit storage errors therefore abort the complete database transaction instead of leaving a committed order without its audit record.
+
+Order creation derives and persists `fiatAmount` from the selected offer price and asset amount. The total is rounded to two decimal places using half-up rounding; a legacy client-supplied `fiatAmount` is accepted but ignored.
+
+Each payment history record retains the legacy `asset` and `asset_issuer` fields and adds `asset_descriptor` with the asset type, code, and issuer. Native XLM uses code `XLM` and a `null` issuer; issued assets include their issuer address.
+
+Stellar payment history accepts `limit` (default 10, maximum 200) and an optional Horizon `cursor`. The response is `{ records, nextCursor? }`; pass `nextCursor` as `cursor` to fetch the next page. `nextCursor` is omitted on the final page.
+
+Sensitive profile changes are recorded as `USER_PROFILE_UPDATED` audit events. Their metadata contains only changed field names (or requested field names on failure); submitted values are never copied into audit metadata. No-op requests are recorded with an empty field list. Profile-image updates use the same event with `profileImageUrl` as the sole field name.
+
 ## Development checks
 
 ```bash
-npm run build       # Compile the NestJS application
-npm test            # Run Jest unit tests
-npm run test:e2e    # Run API and gateway end-to-end tests
-npm run test:cov    # Collect Jest coverage
-npm run format      # Format TypeScript source and tests
+pnpm run build       # Compile the NestJS application
+pnpm test            # Run Jest unit tests
+pnpm run test:e2e    # Run API and gateway end-to-end tests
+pnpm run test:cov    # Collect Jest coverage
+pnpm run format      # Format TypeScript source and tests
 ```
 
 Unit tests use Jest `*.spec.ts` files near the implementation. Add regression coverage for authentication, transaction preparation, escrow transitions, access control, and event processing when changing those areas.
@@ -122,3 +140,21 @@ Never commit or log private keys, JWTs, webhook secrets, full bank details, or i
 ## License
 
 LocalSettle is licensed under the MIT License. See [LICENSE](LICENSE).
+
+HTTP requests and chat socket connections carry a validated `x-correlation-id` (or receive a generated UUID). HTTP responses echo the ID in the same header, and chat persistence failures include the socket connection's ID in structured application logs. Incoming values are limited to 64 ASCII letters, digits, dots, underscores, or hyphens to avoid log injection.
+
+Order creation rejects a buyer's second open order for the same offer. A partial unique database index on `(offer_id, buyer_id)` for `created` and `locked` orders also protects concurrent requests; once an order reaches a terminal state, the buyer can intentionally trade against that offer again.
+
+### Audit-log privacy and retention
+
+Audit writes store IPv4 at `/24` precision and IPv6 at `/64` precision; user-agent strings are omitted. Audit records older than `AUDIT_LOG_RETENTION_DAYS` are deleted daily (default: 365 days; invalid values use the default). The audit repository is internal to the API and does not expose an HTTP export or query endpoint; any future operator-facing query must add explicit role authorization before exposure. Retention deletion is irreversible, so production operators should choose a period that meets applicable forensic and privacy requirements.
+
+### Public statistics privacy and freshness
+
+The public statistics response contains aggregates only and does not return account, wallet, order, or transaction identifiers. Daily waitlist cohorts smaller than five are suppressed. Statistics are cached in process for up to 30 seconds (at most 20 window entries); callers that perform a statistics-affecting write can call `StatsService.invalidateCache()` to clear it. Multi-instance deployments may briefly serve different cached values until each instance refreshes.
+
+### Vulnerability scanning
+
+The `Security scan` workflow audits both committed npm and pnpm lockfiles and scans the built container image on pull requests, pushes to `main`, and weekly. High and critical findings with an available fix fail the job; findings without a published fix are reported but do not block it. The workflow needs only read access to repository contents and does not receive application secrets. Dependency and base-image upgrades should be submitted with the lockfiles and Dockerfile changes so reviewers can inspect the remediation.
+
+`GET /stellar/balances/:publicKey` returns each asset balance as before. The native XLM record also includes `minimum_reserve` and `spendable_balance`; reserve uses the live Horizon base reserve and account subentry/sponsorship counts, and spendable subtracts selling liabilities.
